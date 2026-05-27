@@ -1,5 +1,6 @@
 import { EventPollingService } from '../eventPollingService';
 import { getPrismaClient } from '../prismaClient';
+import { createStellarRpcFetchMock } from './mocks/stellarRpc';
 
 const prisma = getPrismaClient();
 
@@ -347,6 +348,171 @@ describe('EventPollingService', () => {
 
       // Should not crash
       expect(true).toBe(true);
+    });
+  });
+
+  describe('Failure and Gap-Recovery Scenarios', () => {
+    it('retries after an RPC timeout without dropping events', async () => {
+      let cursor = 1000;
+      const storedEvents = new Set<string>();
+      let eventsCallCount = 0;
+
+      (prisma.eventCursor.findUnique as jest.Mock).mockImplementation(async () => ({
+        id: 1,
+        lastLedgerSeq: cursor,
+      }));
+
+      (prisma.eventCursor.upsert as jest.Mock).mockImplementation(async ({ update }) => {
+        cursor = update.lastLedgerSeq;
+        return { id: 1, lastLedgerSeq: cursor };
+      });
+
+      (prisma.processedEvent.findUnique as jest.Mock).mockImplementation(async ({ where }) => {
+        return storedEvents.has(where.id) ? { id: where.id } : null;
+      });
+
+      (prisma.processedEvent.upsert as jest.Mock).mockImplementation(async ({ create }) => {
+        storedEvents.add(create.id);
+        return create;
+      });
+
+      global.fetch = createStellarRpcFetchMock(async ({ method }) => {
+        if (method === 'getLatestLedger') {
+          return { result: { sequence: 1002 } };
+        }
+
+        eventsCallCount += 1;
+        if (eventsCallCount === 1) {
+          throw new Error('RPC timeout');
+        }
+
+        return {
+          result: {
+            events: [
+              {
+                id: 'event-1001',
+                type: 'contract',
+                ledger: 1001,
+                contractId: 'CTEST123',
+                txHash: 'tx-1001',
+              },
+              {
+                id: 'event-1002',
+                type: 'contract',
+                ledger: 1002,
+                contractId: 'CTEST123',
+                txHash: 'tx-1002',
+              },
+            ],
+          },
+        };
+      });
+
+      await (service as any).pollEvents();
+      expect(cursor).toBe(1000);
+      expect(prisma.processedEvent.upsert).not.toHaveBeenCalled();
+
+      await (service as any).pollEvents();
+
+      expect(prisma.processedEvent.upsert).toHaveBeenCalledTimes(2);
+      expect(cursor).toBe(1002);
+      expect(storedEvents.has('event-1001')).toBe(true);
+      expect(storedEvents.has('event-1002')).toBe(true);
+    });
+
+    it('re-fetches all missing ledger ranges during replay', async () => {
+      const requestedRanges: Array<{ start: number; end: number }> = [];
+      const replayService = new EventPollingService({
+        ...mockConfig,
+        batchSize: 100,
+      });
+
+      (prisma.eventCursor.findUnique as jest.Mock).mockResolvedValue({
+        id: 1,
+        lastLedgerSeq: 1000,
+      });
+
+      (prisma.eventCursor.upsert as jest.Mock).mockResolvedValue({});
+      (prisma.processedEvent.findUnique as jest.Mock).mockResolvedValue(null);
+
+      global.fetch = createStellarRpcFetchMock(async ({ method, params }) => {
+        if (method === 'getLatestLedger') {
+          return { result: { sequence: 1200 } };
+        }
+
+        requestedRanges.push({
+          start: params.startLedger,
+          end: params.startLedger + 99,
+        });
+
+        return {
+          result: {
+            events: [],
+          },
+        };
+      });
+
+      await replayService.start();
+      await replayService.stop();
+
+      expect(requestedRanges).toEqual([
+        { start: 1001, end: 1100 },
+        { start: 1101, end: 1200 },
+      ]);
+      expect(prisma.eventCursor.upsert).toHaveBeenCalledTimes(2);
+    });
+
+    it('handles duplicate event delivery idempotently with one DB record', async () => {
+      const storedEvents = new Set<string>();
+
+      (prisma.eventCursor.findUnique as jest.Mock).mockResolvedValue({
+        id: 1,
+        lastLedgerSeq: 1000,
+      });
+
+      (prisma.eventCursor.upsert as jest.Mock).mockResolvedValue({});
+
+      (prisma.processedEvent.findUnique as jest.Mock).mockImplementation(async ({ where }) => {
+        return storedEvents.has(where.id) ? { id: where.id } : null;
+      });
+
+      (prisma.processedEvent.upsert as jest.Mock).mockImplementation(async ({ create }) => {
+        storedEvents.add(create.id);
+        return create;
+      });
+
+      global.fetch = createStellarRpcFetchMock(async ({ method }) => {
+        if (method === 'getLatestLedger') {
+          return { result: { sequence: 1010 } };
+        }
+
+        return {
+          result: {
+            events: [
+              {
+                id: 'duplicate-event',
+                type: 'contract',
+                ledger: 1005,
+                contractId: 'CTEST123',
+                txHash: 'tx-dup',
+              },
+              {
+                id: 'duplicate-event',
+                type: 'contract',
+                ledger: 1005,
+                contractId: 'CTEST123',
+                txHash: 'tx-dup',
+              },
+            ],
+          },
+        };
+      });
+
+      await service.start();
+
+      expect(prisma.processedEvent.upsert).toHaveBeenCalledTimes(1);
+      expect(storedEvents.size).toBe(1);
+      expect(storedEvents.has('duplicate-event')).toBe(true);
     });
   });
 });

@@ -255,7 +255,7 @@ export class EventPollingService {
         endLedger,
         error: error instanceof Error ? error.message : 'Unknown error',
       });
-      return [];
+      throw error;
     }
   }
 }
