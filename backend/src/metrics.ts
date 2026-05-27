@@ -34,6 +34,14 @@ export const activeConnections = new Gauge({
   registers: [register],
 });
 
+export const dbQueryDurationSeconds = new Histogram({
+  name: 'db_query_duration_seconds',
+  help: 'Histogram of Prisma database query duration in seconds',
+  labelNames: ['model', 'action'],
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5],
+  registers: [register],
+});
+
 export const cacheHitCount = new Counter({
   name: 'cache_hit_count',
   help: 'Number of cache hits for GET requests',
