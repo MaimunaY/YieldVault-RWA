@@ -60,6 +60,7 @@ import {
   listWebhookEndpoints,
   listWebhookDeliveries,
   getWebhookDeliveryMetrics,
+  verifyWebhookSignature,
 } from './webhookDelivery';
 import { getJobMetrics, getJobHealthStatus } from './jobGovernance';
 
@@ -78,6 +79,7 @@ declare global {
 const app: Express = express();
 const port = process.env.PORT || 3000;
 const nodeEnv = process.env.NODE_ENV || 'development';
+const isTestRuntime = process.env.NODE_ENV === 'test' || Boolean(process.env.JEST_WORKER_ID);
 const logLevel = (process.env.LOG_LEVEL || (nodeEnv === 'development' ? 'debug' : 'info')) as LogLevel;
 const drainTimeout = parseInt(process.env.DRAIN_TIMEOUT_MS || '30000', 10);
 const cacheVaultMetricsTtl = parseInt(process.env.CACHE_VAULT_METRICS_TTL_MS || '60000', 10);
@@ -686,6 +688,31 @@ app.get('/admin/webhooks/deliveries', validateApiKey, (req: Request, res: Respon
 });
 
 /**
+ * POST /webhooks/verify - validate HMAC-SHA256 signature for webhook payload
+ */
+app.post('/webhooks/verify', (req: Request, res: Response) => {
+  const { secret, payload, signature } = req.body || {};
+
+  if (typeof secret !== 'string' || typeof signature !== 'string' || payload === undefined) {
+    res.status(400).json({
+      error: 'Bad Request',
+      status: 400,
+      message: 'secret, payload, and signature are required',
+    });
+    return;
+  }
+
+  const payloadBody = JSON.stringify(payload);
+  const valid = verifyWebhookSignature(secret, payloadBody, signature);
+
+  res.status(200).json({
+    valid,
+    algorithm: 'HMAC-SHA256',
+    encoding: 'hex',
+  });
+});
+
+/**
  * GET /admin/audit/logs - list admin activity logs
  */
 app.get('/admin/audit/logs', validateApiKey, (req: Request, res: Response) => {
@@ -850,19 +877,21 @@ const pollVaultMetrics = () => {
 // Start poll cycle every 60 seconds (configurable)
 const METRICS_POLL_INTERVAL = parseInt(process.env.METRICS_POLL_INTERVAL_MS || '60000', 10);
 const metricsInterval =
-  process.env.NODE_ENV === 'test'
+  isTestRuntime
     ? null
     : setInterval(pollVaultMetrics, METRICS_POLL_INTERVAL);
 
-if (process.env.NODE_ENV !== 'test') {
+if (!isTestRuntime) {
   pollVaultMetrics(); // Initial call
 }
 
-// Start latency monitoring
-latencyMonitoringService.startMonitoring();
+// Start latency monitoring only outside tests to avoid open handles in Jest.
+if (!isTestRuntime) {
+  latencyMonitoringService.startMonitoring();
+}
 
 // ─── Event Polling Service (Issue: Event Replay) ────────────────────────────
-if (process.env.NODE_ENV !== 'test' && process.env.VAULT_CONTRACT_ID) {
+if (!isTestRuntime && process.env.VAULT_CONTRACT_ID) {
   startEventPollingService({
     rpcUrl: process.env.STELLAR_RPC_URL || 'https://soroban-testnet.stellar.org',
     contractId: process.env.VAULT_CONTRACT_ID,
@@ -986,7 +1015,7 @@ app.use((req: Request, res: Response) => {
 
 // ─── Server Start ───────────────────────────────────────────────────────────
 
-if (process.env.NODE_ENV !== 'test') {
+if (!isTestRuntime) {
   const server = app.listen(port, () => {
     logger.log('info', '🚀 YieldVault Backend started', {
       port,

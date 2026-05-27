@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { prisma } from './prisma';
 
 export type TransactionEventType =
   | 'transaction.deposit.created'
@@ -19,9 +20,14 @@ export interface WebhookEndpoint {
   url: string;
   eventTypes: TransactionEventType[];
   enabled: boolean;
-  secret?: string;
+  hasSecret: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+interface StoredWebhookEndpoint extends WebhookEndpoint {
+  secret?: string;
+  secretHash?: string;
 }
 
 export type WebhookDeliveryStatus = 'pending' | 'delivered' | 'failed';
@@ -52,7 +58,7 @@ interface UpdateWebhookInput {
   secret?: string;
 }
 
-const endpoints = new Map<string, WebhookEndpoint>();
+const endpoints = new Map<string, StoredWebhookEndpoint>();
 const deliveries: WebhookDeliveryRecord[] = [];
 
 const maxAttempts = parseInt(process.env.WEBHOOK_MAX_ATTEMPTS || '3', 10);
@@ -64,20 +70,24 @@ export function registerWebhookEndpoint(input: RegisterWebhookInput): WebhookEnd
   assertValidWebhookUrl(input.url);
 
   const now = new Date().toISOString();
-  const endpoint: WebhookEndpoint = {
+  const secretHash = input.secret ? hashSecret(input.secret) : undefined;
+  const endpoint: StoredWebhookEndpoint = {
     id: `wh_${crypto.randomBytes(6).toString('hex')}`,
     url: input.url,
     eventTypes: input.eventTypes && input.eventTypes.length > 0
       ? input.eventTypes
       : ['transaction.deposit.created', 'transaction.withdrawal.created'],
     enabled: input.enabled ?? true,
+    hasSecret: Boolean(input.secret),
     secret: input.secret,
+    secretHash,
     createdAt: now,
     updatedAt: now,
   };
 
   endpoints.set(endpoint.id, endpoint);
-  return endpoint;
+  void persistEndpointSecret(endpoint.id, secretHash);
+  return sanitizeEndpoint(endpoint);
 }
 
 export function updateWebhookEndpoint(id: string, input: UpdateWebhookInput): WebhookEndpoint | null {
@@ -90,20 +100,27 @@ export function updateWebhookEndpoint(id: string, input: UpdateWebhookInput): We
     throw new Error('eventTypes cannot be empty');
   }
 
-  const updated: WebhookEndpoint = {
+  const nextSecret = input.secret ?? existing.secret;
+  const nextSecretHash = nextSecret ? hashSecret(nextSecret) : undefined;
+  const updated: StoredWebhookEndpoint = {
     ...existing,
     enabled: input.enabled ?? existing.enabled,
     eventTypes: input.eventTypes ?? existing.eventTypes,
-    secret: input.secret ?? existing.secret,
+    hasSecret: Boolean(nextSecret),
+    secret: nextSecret,
+    secretHash: nextSecretHash,
     updatedAt: new Date().toISOString(),
   };
 
   endpoints.set(id, updated);
-  return updated;
+  void persistEndpointSecret(id, nextSecretHash);
+  return sanitizeEndpoint(updated);
 }
 
 export function listWebhookEndpoints(): WebhookEndpoint[] {
-  return Array.from(endpoints.values()).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  return Array.from(endpoints.values())
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .map(sanitizeEndpoint);
 }
 
 export function listWebhookDeliveries(limit = 100): WebhookDeliveryRecord[] {
@@ -141,6 +158,22 @@ export function getWebhookDeliveryMetrics() {
 export function resetWebhookState(): void {
   endpoints.clear();
   deliveries.length = 0;
+}
+
+export function computeWebhookSignature(secret: string, payloadBody: string): string {
+  return crypto.createHmac('sha256', secret).update(payloadBody).digest('hex');
+}
+
+export function verifyWebhookSignature(secret: string, payloadBody: string, signature: string): boolean {
+  const expected = computeWebhookSignature(secret, payloadBody);
+  const left = Buffer.from(expected, 'utf8');
+  const right = Buffer.from(signature || '', 'utf8');
+
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(left, right);
 }
 
 export async function emitTransactionEvent(
@@ -189,7 +222,7 @@ function assertValidWebhookUrl(url: string): void {
 }
 
 async function deliverWithRetry(
-  endpoint: WebhookEndpoint,
+  endpoint: StoredWebhookEndpoint,
   delivery: WebhookDeliveryRecord,
   payload: TransactionEventPayload,
   attempt: number,
@@ -212,10 +245,7 @@ async function deliverWithRetry(
   };
 
   if (endpoint.secret) {
-    headers['X-YieldVault-Signature'] = crypto
-      .createHmac('sha256', endpoint.secret)
-      .update(body)
-      .digest('hex');
+    headers['X-YieldVault-Signature'] = computeWebhookSignature(endpoint.secret, body);
   }
 
   const controller = new AbortController();
@@ -255,6 +285,61 @@ async function deliverWithRetry(
     delivery.updatedAt = new Date().toISOString();
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+function sanitizeEndpoint(endpoint: StoredWebhookEndpoint): WebhookEndpoint {
+  return {
+    id: endpoint.id,
+    url: endpoint.url,
+    eventTypes: endpoint.eventTypes,
+    enabled: endpoint.enabled,
+    hasSecret: endpoint.hasSecret,
+    createdAt: endpoint.createdAt,
+    updatedAt: endpoint.updatedAt,
+  };
+}
+
+function hashSecret(secret: string): string {
+  return crypto.createHash('sha256').update(secret).digest('hex');
+}
+
+async function persistEndpointSecret(endpointId: string, secretHash?: string): Promise<void> {
+  if (process.env.NODE_ENV === 'test') {
+    return;
+  }
+
+  try {
+    await prisma.$executeRawUnsafe(`
+      CREATE TABLE IF NOT EXISTS webhook_endpoint_secret_hashes (
+        endpoint_id TEXT PRIMARY KEY,
+        secret_hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `);
+
+    if (!secretHash) {
+      await prisma.$executeRawUnsafe(
+        'DELETE FROM webhook_endpoint_secret_hashes WHERE endpoint_id = ?',
+        endpointId,
+      );
+      return;
+    }
+
+    await prisma.$executeRawUnsafe(
+      `
+      INSERT INTO webhook_endpoint_secret_hashes (endpoint_id, secret_hash, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(endpoint_id) DO UPDATE
+      SET secret_hash = excluded.secret_hash,
+          updated_at = excluded.updated_at
+      `,
+      endpointId,
+      secretHash,
+      new Date().toISOString(),
+    );
+  } catch {
+    // Non-fatal persistence fallback to preserve webhook delivery behavior.
   }
 }
 
